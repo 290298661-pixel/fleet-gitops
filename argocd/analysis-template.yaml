@@ -1,5 +1,10 @@
-# Fleet Canary AnalysisTemplate
+# Fleet Canary AnalysisTemplate (参考定义)
 # ★ 核心亮点: 金丝雀健康检查调用自己写的 NHW 巡检系统
+#
+# ⚠️ 此文件是 argocd namespace 下的参考定义。
+#    GFD Rollout 使用 game-fleet-system namespace 中的副本，
+#    位于 argocd/rollouts/game-fleet-director.yaml (第三个文档)。
+#    Argo Rollouts 要求 AnalysisTemplate 与 Rollout 在同一 namespace。
 #
 # 四项分析指标覆盖三个层次:
 #   1. NHW 节点健康分 — 基础设施层 (web metric → 自己写的巡检系统)

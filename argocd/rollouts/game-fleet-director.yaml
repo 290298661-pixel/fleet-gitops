@@ -1,0 +1,279 @@
+# Argo Rollouts — Game Fleet Director
+# 替代标准 Deployment，实现金丝雀发布 + 自动回滚
+#
+# 完整发布流程 (production):
+#   Step 1: 20% canary pods → pause 120s → AnalysisTemplate (4 项检查)
+#   Step 2: 50% canary pods → pause 120s → AnalysisTemplate (4 项检查)
+#   Step 3: 100% → 全量切换，旧 ReplicaSet 缩容到 0
+#
+# 任意 Analysis 失败 → 自动回滚到 stable ReplicaSet
+# 回滚后触发 rollback-diagnose Job (见 argocd/hooks/)
+#
+# 使用:
+#   kubectl apply -f argocd/rollouts/game-fleet-director.yaml
+#   kubectl argo rollouts get rollout gfd-apiserver -n game-fleet-system
+#   kubectl argo rollouts promote gfd-apiserver -n game-fleet-system
+#   kubectl argo rollouts abort gfd-apiserver -n game-fleet-system
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# GFD API Server Rollout — 用户面，完整三阶段金丝雀
+#
+# 这是整个平台最关键的 Rollout:
+#   - API Server 处理游戏服分配请求 (玩家进游戏)
+#   - 分配失败 = 玩家直接受影响
+#   - 必须用完整的 20%→50%→100% 金丝雀保护
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: gfd-apiserver
+  namespace: game-fleet-system
+  labels:
+    app: game-fleet-director
+    component: apiserver
+spec:
+  replicas: 3
+
+  # 选择器 — Service 用同样 label 选中 canary + stable pod
+  selector:
+    matchLabels:
+      app: game-fleet-director
+      component: apiserver
+
+  # Pod 模板 (与 Deployment 完全相同，可直接替换)
+  template:
+    metadata:
+      labels:
+        app: game-fleet-director
+        component: apiserver
+    spec:
+      serviceAccountName: gfd-apiserver
+      containers:
+        - name: apiserver
+          image: ghcr.io/290298661-pixel/game-fleet-director-apiserver:latest
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: LOG_LEVEL
+              value: info
+            - name: METRICS_PORT
+              value: "9090"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+  strategy:
+    canary:
+      # ── 金丝雀步骤 (对应 ADR-003) ──
+      steps:
+        # Step 1: 20% canary — 最小爆炸半径
+        - setWeight: 20
+        - pause:
+            duration: 120s     # 等 Prometheus 抓取 4 轮 (30s×4)
+        - analysis:
+            templates:
+              - templateName: fleet-canary-health
+                args:
+                  - name: fleet-name
+                    value: battle-royale-fleet
+
+        # Step 2: 50% canary — 扩大样本验证
+        - setWeight: 50
+        - pause:
+            duration: 120s
+        - analysis:
+            templates:
+              - templateName: fleet-canary-health
+                args:
+                  - name: fleet-name
+                    value: battle-royale-fleet
+
+        # Step 3: 100% — 全量切换
+        - setWeight: 100
+
+      # ── 安全配置 ──
+      # 每步 Analysis 通过后需人工确认 (SRE 最佳实践)
+      autoPromotionEnabled: false
+
+      # 金丝雀期间最多允许 1 个不可用 pod
+      maxUnavailable: 1
+
+      # 金丝雀 label — 方便监控区分 canary vs stable pod
+      canaryMetadata:
+        labels:
+          rollouts.argoproj.io/canary: "true"
+
+      # 缩容策略: 先缩 canary，保留 stable
+      scaleDown:
+        revisionHistoryLimit: 3
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# GFD Controller Rollout — 控制面，保守发布
+#
+# Controller 负责舰队扩缩容逻辑:
+#   - 单实例运行 (leader election)
+#   - 不能中断 (maxUnavailable: 0)
+#   - 不需要流量分步 (单实例分权重无意义)
+#   - 保留 Rollout 格式是为了 ArgoCD UI 统一管理 + Analysis 保护
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: gfd-controller
+  namespace: game-fleet-system
+  labels:
+    app: game-fleet-director
+    component: controller
+spec:
+  replicas: 1        # 单实例 + leader election
+
+  selector:
+    matchLabels:
+      app: game-fleet-director
+      component: controller
+
+  template:
+    metadata:
+      labels:
+        app: game-fleet-director
+        component: controller
+    spec:
+      serviceAccountName: gfd-controller
+      containers:
+        - name: controller
+          image: ghcr.io/290298661-pixel/game-fleet-director-controller:latest
+          ports:
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: LEADER_ELECTION
+              value: "true"
+            - name: METRICS_PORT
+              value: "9090"
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 5
+
+  strategy:
+    canary:
+      maxSurge: "1"
+      maxUnavailable: "0"       # Controller 零中断
+      steps:
+        - setWeight: 100        # 单实例直接切换
+      # Controller 也用 AnalysisTemplate 跑一次检查
+      # 检查通过 = 新 Controller 健康，旧实例安全回收
+      analysis:
+        templates:
+          - templateName: fleet-canary-health
+            args:
+              - name: fleet-name
+                value: battle-royale-fleet
+
+---
+# ═══════════════════════════════════════════════════════════════════
+# AnalysisTemplate — game-fleet-system namespace
+#
+# 与 argocd/analysis-template.yaml 内容相同，但在 Rollout 所属 namespace。
+# Argo Rollouts 要求 AnalysisTemplate 与 Rollout 在同一 namespace。
+#
+# ★ 这是金丝雀发布的核心质量门禁。
+#    四项指标覆盖基础设施→应用→控制三层。
+# ═══════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: fleet-canary-health
+  namespace: game-fleet-system
+spec:
+  args:
+    - name: fleet-name
+      value: "battle-royale-fleet"
+    - name: nhw-endpoint
+      value: "http://node-health-watcher.nhw-system.svc.cluster.local:8080"
+    - name: prometheus-endpoint
+      value: "http://prometheus.monitoring.svc.cluster.local:9090"
+
+  metrics:
+    # ── 指标 1: NHW 节点健康状态 ──
+    # ★ 自研巡检系统 — 基站故障前兆在应用层指标恶化之前暴露
+    - name: node-health-score
+      provider:
+        web:
+          url: "{{ args.nhw-endpoint }}/api/v1/node-health"
+          timeoutSeconds: 10
+          jsonPath: "{$.summary.healthy_ratio}"
+      successCondition: "result >= 0.8"
+      failureLimit: 2          # 连续 2 次失败才判定
+      failureCondition: "result < 0.6"
+      interval: 30s
+
+    # ── 指标 2: 游戏服分配成功率 ──
+    # 分配失败 = 玩家进不去游戏 (核心业务指标)
+    - name: allocation-success-rate
+      interval: 30s
+      failureLimit: 2
+      successCondition: "result >= 0.99"
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-endpoint }}"
+          query: |
+            sum(rate(gfd_allocation_total{phase="Allocated"}[5m]))
+            /
+            sum(rate(gfd_allocation_total{}[5m]))
+
+    # ── 指标 3: 分配延迟 P99 ──
+    # P99 < 2s (用户体验)
+    - name: allocation-latency-p99
+      interval: 30s
+      failureLimit: 3
+      successCondition: "result < 2.0"
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-endpoint }}"
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(gfd_allocation_latency_seconds_bucket[5m])) by (le))
+
+    # ── 指标 4: 扩缩容熔断器 ──
+    # 熔断器触发 = Scaler 出问题 (控制层健康)
+    - name: scaling-circuit-breaker
+      interval: 30s
+      failureLimit: 1
+      successCondition: "result == 0"
+      failureCondition: "result >= 1"
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-endpoint }}"
+          query: |
+            sum(gfd_circuit_breaker_triggered)
